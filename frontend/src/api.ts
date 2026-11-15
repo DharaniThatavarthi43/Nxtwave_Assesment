@@ -9,7 +9,7 @@ import type {
   KnowledgeDocument,
   KnowledgeSearchResult,
   LearnedRule,
-  RejectionListItem,
+  RejectionLogResponse,
   RunDetail,
   RunList,
   StartRunResponse,
@@ -99,7 +99,7 @@ export const api = {
   rejections: (runId?: string) => {
     const params = new URLSearchParams({ limit: "300" });
     if (runId) params.set("run_id", runId);
-    return requestJson<RejectionListItem[]>(`/api/rejections?${params.toString()}`);
+    return requestJson<RejectionLogResponse>(`/api/rejections?${params.toString()}`);
   },
   learnedRules: () =>
     requestJson<LearnedRule[]>("/api/learning/rules"),

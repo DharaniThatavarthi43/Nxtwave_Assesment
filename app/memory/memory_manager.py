@@ -295,20 +295,21 @@ class MemoryManager:
         return attempt
 
     def get_failed_generation_attempts(
-        self, run_id: UUID
+        self, run_id: UUID | None = None
     ) -> list[FailedGenerationAttempt]:
+        query = """
+            SELECT failure_id, run_id, attempt_number, status, failure_stage,
+                   error_category, validation_subcode, error_type,
+                   error_description, timestamp
+            FROM failed_generation_attempts
+        """
+        parameters: tuple[str, ...] = ()
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters = (str(run_id),)
+        query += " ORDER BY timestamp, failure_id"
         with connect(self.database_path) as connection:
-            rows = connection.execute(
-                """
-                SELECT failure_id, run_id, attempt_number, status, failure_stage,
-                       error_category, validation_subcode, error_type,
-                       error_description, timestamp
-                FROM failed_generation_attempts
-                WHERE run_id = ?
-                ORDER BY attempt_number
-                """,
-                (str(run_id),),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [
             FailedGenerationAttempt.model_validate(dict(row))
             for row in rows
@@ -377,20 +378,21 @@ class MemoryManager:
         return attempt
 
     def get_failed_evaluation_attempts(
-        self, run_id: UUID
+        self, run_id: UUID | None = None
     ) -> list[FailedEvaluationAttempt]:
+        query = """
+            SELECT failure_id, run_id, attempt_number, status, failure_stage,
+                   error_category, retry_disposition, error_type,
+                   error_description, timestamp
+            FROM failed_evaluation_attempts
+        """
+        parameters: tuple[str, ...] = ()
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters = (str(run_id),)
+        query += " ORDER BY timestamp, failure_id"
         with connect(self.database_path) as connection:
-            rows = connection.execute(
-                """
-                SELECT failure_id, run_id, attempt_number, status, failure_stage,
-                       error_category, retry_disposition, error_type,
-                       error_description, timestamp
-                FROM failed_evaluation_attempts
-                WHERE run_id = ?
-                ORDER BY attempt_number
-                """,
-                (str(run_id),),
-            ).fetchall()
+            rows = connection.execute(query, parameters).fetchall()
         return [
             FailedEvaluationAttempt.model_validate(dict(row))
             for row in rows

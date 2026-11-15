@@ -183,6 +183,25 @@ export interface RejectionListItem {
   retry_attempt_status: CheckpointStatus | null;
 }
 
+export interface RejectionFailureItem {
+  failure_id: string;
+  run_id: string;
+  topic: string | null;
+  mode: GenerationMode | null;
+  attempt_number: number;
+  failure_kind: "generation" | "evaluation";
+  failure_stage: string;
+  error_category: string;
+  error_type: string;
+  error_description: string;
+  recorded_at: string;
+}
+
+export interface RejectionLogResponse {
+  items: RejectionListItem[];
+  failures: RejectionFailureItem[];
+}
+
 export interface LearnedRule {
   rule: {
     rule_id: string;

@@ -157,6 +157,25 @@ class RejectionListItem(ApiModel):
     retry_attempt_status: CheckpointStatus | None = None
 
 
+class RejectionFailureItem(ApiModel):
+    failure_id: UUID
+    run_id: UUID
+    topic: str | None
+    mode: PersistedGenerationMode | None
+    attempt_number: int
+    failure_kind: Literal["generation", "evaluation"]
+    failure_stage: str
+    error_category: str
+    error_type: str
+    error_description: str
+    recorded_at: datetime
+
+
+class RejectionLogResponse(ApiModel):
+    items: tuple[RejectionListItem, ...]
+    failures: tuple[RejectionFailureItem, ...]
+
+
 class LearnedRuleResponse(ApiModel):
     rule: LearnedRule
     distinct_supporting_runs: int

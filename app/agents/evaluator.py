@@ -1,5 +1,6 @@
 import math
 import re
+import unicodedata
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -8,6 +9,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import HumanMessage
 from pydantic import Field, ValidationError, model_validator
 
 from app.config import ConfigurationError, Settings, load_settings
@@ -31,7 +33,9 @@ from app.schemas import (
 
 
 MAX_EVALUATOR_API_RETRIES = 2
+MAX_EVALUATOR_OUTPUT_RETRIES = 2
 EVALUATOR_RETRY_BASE_DELAY_SECONDS = 1.0
+TOKEN_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
 
 
 class EvaluatorError(RuntimeError):
@@ -102,7 +106,12 @@ def evaluate_lesson(
     messages = format_evaluation_messages(lesson, references)
 
     try:
-        model = create_chat_model(current_settings, max_retries=0)
+        model = create_chat_model(
+            current_settings,
+            max_retries=0,
+            max_output_tokens=2048,
+            reasoning_effort="low",
+        )
         structured_model = model.with_structured_output(_EvaluatorResponse)
     except ConfigurationError as exc:
         raise EvaluatorError(
@@ -114,13 +123,30 @@ def evaluate_lesson(
     except Exception as exc:
         raise _provider_evaluator_error(exc) from exc
 
-    response = _invoke_with_bounded_retries(
-        lambda: structured_model.invoke(messages),
-        max_retry_after_seconds=current_settings.evaluator_max_retry_after_seconds,
-    )
-
-    evaluator_response = _validate_model_response(response)
-    _validate_evidence(evaluator_response, lesson, references)
+    evaluator_messages = list(messages)
+    for output_retry in range(MAX_EVALUATOR_OUTPUT_RETRIES + 1):
+        response = _invoke_with_bounded_retries(
+            lambda: structured_model.invoke(evaluator_messages),
+            max_retry_after_seconds=current_settings.evaluator_max_retry_after_seconds,
+        )
+        try:
+            evaluator_response = _validate_model_response(response)
+            _validate_evidence(evaluator_response, lesson, references)
+            break
+        except EvaluatorError as exc:
+            if output_retry >= MAX_EVALUATOR_OUTPUT_RETRIES:
+                raise
+            evaluator_messages = [
+                *messages,
+                HumanMessage(
+                    content=(
+                        "Your previous checkpoint response failed local validation: "
+                        f"{exc} Return a complete corrected result for C1 through C6. "
+                        "For evidence, copy one complete sentence from the lesson "
+                        "word for word. Do not paraphrase, shorten, or use ellipses."
+                    )
+                ),
+            ]
 
     checkpoints_by_id = {
         checkpoint.checkpoint_id: checkpoint
@@ -205,7 +231,8 @@ def _invoke_with_bounded_retries(
         except Exception as exc:
             status_code = _http_status_code(exc)
             retry_after = _retry_after_seconds(exc)
-            retryable = status_code == 429 or (
+            token_rate_limited = _is_token_rate_limited(exc)
+            retryable = status_code == 429 or token_rate_limited or (
                 status_code is not None and 500 <= status_code <= 599
             )
             if not retryable:
@@ -227,6 +254,8 @@ def _invoke_with_bounded_retries(
                         ),
                     ) from exc
                 delay = retry_after
+            elif token_rate_limited:
+                delay = TOKEN_RATE_LIMIT_RETRY_DELAY_SECONDS
             else:
                 delay = min(
                     EVALUATOR_RETRY_BASE_DELAY_SECONDS * (2**retry_number),
@@ -256,6 +285,18 @@ def _http_status_code(error: Exception) -> int | None:
         if type(status_code) is int and 100 <= status_code <= 599:
             return status_code
     return None
+
+
+def _is_token_rate_limited(error: Exception) -> bool:
+    body = getattr(error, "body", None)
+    response = getattr(error, "response", None)
+    if body is None and response is not None:
+        try:
+            body = response.json()
+        except (AttributeError, TypeError, ValueError):
+            body = None
+    message = str(body).casefold() if body is not None else str(error).casefold()
+    return "rate_limit_exceeded" in message or "tokens per minute" in message
 
 
 def _retry_after_seconds(error: Exception) -> float | None:
@@ -296,7 +337,7 @@ def _provider_evaluator_error(
     ),
 ) -> EvaluatorError:
     status_code = _http_status_code(error)
-    if status_code == 429:
+    if status_code == 429 or _is_token_rate_limited(error):
         category = EvaluationErrorCategory.RATE_LIMITED
     elif status_code is not None and 500 <= status_code <= 599:
         category = EvaluationErrorCategory.PROVIDER_SERVER_ERROR
@@ -364,8 +405,7 @@ def _validate_evidence(
             raise EvaluatorError(
                 f"{checkpoint.checkpoint_id.value} requires a clear evaluation reason."
             )
-        normalized_evidence = _normalize_text(checkpoint.evidence)
-        if len(normalized_evidence) < 15 or normalized_evidence not in normalized_lesson:
+        if not _evidence_is_supported(checkpoint.evidence, normalized_lesson):
             raise EvaluatorError(
                 f"{checkpoint.checkpoint_id.value} evidence is not a verbatim "
                 "excerpt from the candidate lesson."
@@ -392,4 +432,31 @@ def _extract_citations(text: str) -> set[str]:
 
 
 def _normalize_text(text: str) -> str:
-    return " ".join(text.split()).casefold()
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", normalized).split())
+
+
+def _evidence_is_supported(evidence: str, normalized_lesson: str) -> bool:
+    normalized_evidence = _normalize_text(evidence)
+    if len(normalized_evidence) < 15:
+        return False
+    if normalized_evidence in normalized_lesson:
+        return True
+
+    # Allow an ellipsis to mark omitted text in a quote, while still requiring
+    # every quoted segment to occur verbatim and in order in the lesson. This
+    # handles common evaluator output for long examples and numbered lists.
+    segments = re.split(r"(?:\.{3,}|…+)", evidence)
+    normalized_segments = [_normalize_text(segment) for segment in segments]
+    normalized_segments = [segment for segment in normalized_segments if segment]
+    if len(normalized_segments) < 2:
+        return False
+    position = 0
+    for segment in normalized_segments:
+        if len(segment) < 12:
+            return False
+        match_at = normalized_lesson.find(segment, position)
+        if match_at < 0:
+            return False
+        position = match_at + len(segment)
+    return True

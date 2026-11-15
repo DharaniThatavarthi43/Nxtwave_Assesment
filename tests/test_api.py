@@ -138,6 +138,39 @@ def make_rejected_runner():
     return runner
 
 
+def make_mismatched_evaluator_runner():
+    def evaluator(**kwargs):
+        lesson = kwargs["lesson"]
+        return EvaluationResult(
+            run_id=uuid4(),
+            attempt_number=lesson.attempt_number,
+            overall_status=CheckpointStatus.PASS,
+            checkpoints=tuple(
+                EvaluationCheckpoint(
+                    checkpoint_id=checkpoint_id,
+                    status=CheckpointStatus.PASS,
+                    reason=f"The lesson meets the requirement for {checkpoint_id.value}.",
+                    evidence=lesson.sections["Introduction"],
+                )
+                for checkpoint_id in CheckpointId
+            ),
+            failed_checkpoints=(),
+            correction_instructions=(),
+            overall_reason="All six mandatory checkpoints passed.",
+        )
+
+    def runner(**kwargs):
+        return run_lesson_workflow(
+            **kwargs,
+            generator_fn=lambda **generation_kwargs: make_lesson(
+                generation_kwargs["attempt_number"]
+            ),
+            evaluator_fn=evaluator,
+        )
+
+    return runner
+
+
 def wait_for_status(client: TestClient, run_id: str) -> dict:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -279,6 +312,44 @@ def test_api_runner_failure_is_safe_and_not_reported_as_in_progress(
     assert result["evaluations"] == []
     assert result["artifacts"] == []
     assert not output_root.exists()
+
+
+def test_rejection_log_includes_evaluator_failures_without_checkpoint_rejections(
+    tmp_path: Path,
+) -> None:
+    application = create_app(
+        settings=make_settings(tmp_path / "evaluation-failure.sqlite3"),
+        output_root=tmp_path / "evaluation-failure-outputs",
+        workflow_runner=make_mismatched_evaluator_runner(),
+    )
+    with TestClient(application) as client:
+        document = client.app.state.runtime.knowledge_base.ingest_upload(
+            filename="rag-reference.txt",
+            content="Introduction to RAG. Retrieval augmented generation uses retrieved knowledge to support an LLM answer.",
+        )
+        started = client.post(
+            "/api/runs",
+            json={
+                "request_id": str(uuid4()),
+                "topic": DEFAULT_TOPIC,
+                "mode": "rag",
+                "knowledge_base_id": str(document.document_id),
+            },
+        )
+        assert started.status_code == 202
+        run_id = started.json()["run_id"]
+        result = wait_for_status(client, run_id)
+        assert result["status"] == "FAILED"
+
+        log = client.get("/api/rejections", params={"run_id": run_id})
+        assert log.status_code == 200
+        assert log.json()["items"] == []
+        assert len(log.json()["failures"]) == 1
+        failure = log.json()["failures"][0]
+        assert failure["failure_kind"] == "evaluation"
+        assert failure["attempt_number"] == 1
+        assert failure["error_category"] == "evaluation_validation_error"
+        assert "different run or attempt" in failure["error_description"]
 
 
 def test_output_failure_does_not_change_approved_decision(tmp_path: Path) -> None:
@@ -434,7 +505,7 @@ def test_demo_run_uses_three_attempts_and_persists_approved_note_across_restart(
             params={"run_id": run_id},
         )
         assert rejection_response.status_code == 200
-        rejection_items = rejection_response.json()
+        rejection_items = rejection_response.json()["items"]
         assert [item["rejection"]["attempt_number"] for item in rejection_items] == [
             2,
             1,
@@ -490,7 +561,7 @@ def test_demo_run_uses_three_attempts_and_persists_approved_note_across_restart(
         assert persisted_rejections.status_code == 200
         assert [
             item["rejection"]["attempt_number"]
-            for item in persisted_rejections.json()
+            for item in persisted_rejections.json()["items"]
         ] == [2, 1]
 
 
@@ -518,11 +589,11 @@ def test_rejection_api_filters_records_by_run_and_returns_retry_feedback(
             run_ids.append(started.json()["run_id"])
             assert wait_for_status(client, run_ids[-1])["status"] == "REJECTED"
 
-        assert len(client.get("/api/rejections").json()) == 6
+        assert len(client.get("/api/rejections").json()["items"]) == 6
         first_run_items = client.get(
             "/api/rejections",
             params={"run_id": run_ids[0]},
-        ).json()
+        ).json()["items"]
         assert len(first_run_items) == 3
         assert all(item["rejection"]["run_id"] == run_ids[0] for item in first_run_items)
         by_attempt = {
@@ -548,8 +619,8 @@ def test_rejection_api_filters_records_by_run_and_returns_retry_feedback(
             params={"run_id": run_ids[0]},
         )
         assert persisted.status_code == 200
-        assert len(persisted.json()) == 3
-        assert {item["rejection"]["run_id"] for item in persisted.json()} == {
+        assert len(persisted.json()["items"]) == 3
+        assert {item["rejection"]["run_id"] for item in persisted.json()["items"]} == {
             run_ids[0]
         }
 

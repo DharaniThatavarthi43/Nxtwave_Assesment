@@ -47,7 +47,10 @@ check factual claims; do not treat citations as proof by themselves.
 For every checkpoint, provide a clear reason and one exact, contiguous excerpt
 copied from the candidate lesson as evidence. Do not paraphrase or invent the
 evidence excerpt. If no suitable supporting excerpt exists, FAIL that
-checkpoint. PASS only when the stated condition is clearly satisfied by the
+checkpoint. Copy the lesson's words exactly; punctuation, markdown styling, or
+Unicode dash variants may be normalized by the application, but do not rewrite
+or summarize the words. Do not use ellipses to replace words unless every
+quoted segment is copied exactly and remains in the original order. PASS only when the stated condition is clearly satisfied by the
 lesson and the evidence supports that judgment. If uncertain, FAIL.
 
 For each failed checkpoint, provide at least one specific correction

@@ -12,6 +12,8 @@ import type {
   AppSettings,
   Knowledge,
   LearnedRule,
+  RejectionFailureItem,
+  RejectionLogResponse,
   RejectionListItem,
 } from "../types";
 import { MarkdownContent } from "../components/MarkdownContent";
@@ -38,6 +40,7 @@ const checkpointLabel: Record<string, string> = {
 export function RejectionsPage() {
   const { t } = useLanguage();
   const [records, setRecords] = useState<RejectionListItem[] | null>(null);
+  const [failures, setFailures] = useState<RejectionFailureItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -49,11 +52,16 @@ export function RejectionsPage() {
     let timer: number | undefined;
 
     const refresh = async (manual = false) => {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
       if (manual) setRefreshing(true);
       try {
-        const value = await api.rejections();
+        const value: RejectionLogResponse = await api.rejections();
         if (active) {
-          setRecords(value);
+          setRecords(value.items);
+          setFailures(value.failures);
           setError(null);
           setLastUpdated(new Date());
         }
@@ -67,7 +75,7 @@ export function RejectionsPage() {
         if (active) {
           setLoading(false);
           setRefreshing(false);
-          if (!manual) timer = window.setTimeout(() => void refresh(), 2000);
+          timer = window.setTimeout(() => void refresh(), 1500);
         }
       }
     };
@@ -132,6 +140,11 @@ export function RejectionsPage() {
               <strong>{records.length}</strong>
               <span>{t("Showing the latest {count} records available to the API.", { count: records.length })}</span>
             </div>
+            <div className="panel rejection-summary-card">
+              <span className="eyebrow">{t("WORKFLOW FAILURES")}</span>
+              <strong>{failures.length}</strong>
+              <span>{t("Generation and evaluator failures from saved run diagnostics.")}</span>
+            </div>
             <div className="panel rejection-summary-card wide">
               <span className="eyebrow">{t("CHECKPOINT FAILURE FREQUENCY")}</span>
               {counts.length === 0 ? (
@@ -152,6 +165,35 @@ export function RejectionsPage() {
             </div>
           </section>
 
+          {failures.length > 0 && (
+            <section className="panel rejection-list-panel" aria-live="polite">
+              <div className="panel-heading">
+                <div>
+                  <span className="eyebrow">{t("GENERATION / EVALUATION FAILURES")}</span>
+                  <h2>{t("Runs that stopped before a checkpoint decision")}</h2>
+                </div>
+              </div>
+              <div className="rejection-list">
+                {failures.map((failure) => (
+                  <article className="diagnostic-card" key={failure.failure_id}>
+                    <strong>
+                      {failure.topic ?? t("Unknown topic")} · {failure.failure_kind === "evaluation" ? t("Evaluator") : t("Generation")} A{failure.attempt_number}
+                    </strong>
+                    <span>{failure.failure_stage.replaceAll("_", " ")} · {failure.error_category} · {failure.error_type}</span>
+                    <p>
+                      <strong>{t("Failure reason")}:</strong>{" "}
+                      {failure.error_category === "evaluation_validation_error" &&
+                      failure.error_description === "Evaluator output failed application validation."
+                        ? t("The evaluator response failed validation before C1–C6 results were saved. No checkpoint-specific reason is available for this attempt.")
+                        : failure.error_description}
+                    </p>
+                    <RunLink runId={failure.run_id} />
+                  </article>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="panel rejection-list-panel">
             <div className="panel-heading">
               <div>
@@ -162,7 +204,7 @@ export function RejectionsPage() {
             {records.length === 0 ? (
               <EmptyState
                 title="No rejection records"
-                description="The rejection log will show actual checkpoint failures once an evaluation rejects an attempt."
+                description={failures.length > 0 ? "This run stopped before a checkpoint rejection could be recorded. See the workflow failure details above." : "The rejection log will show actual checkpoint failures once an evaluation rejects an attempt."}
               />
             ) : (
               <div className="rejection-list">
@@ -177,8 +219,8 @@ export function RejectionsPage() {
                       {group.finalStatus && <StatusPill status={group.finalStatus} />}
                     </div>
                     {group.records.map(({ rejection, feedback_sent, retry_attempt_status }) => (
-                      <details className="rejection-entry" key={rejection.rejection_id}>
-                        <summary>
+                      <article className="rejection-entry" key={rejection.rejection_id}>
+                        <div className="rejection-entry-header">
                           <span className="rejection-attempt">A{rejection.attempt_number}</span>
                           <span className="rejection-summary-copy">
                             <strong>{rejection.failed_checkpoints.join(", ")}</strong>
@@ -199,8 +241,20 @@ export function RejectionsPage() {
                                   retry_attempt_status ?? t("Not evaluated")
                                 }`}
                           </span>
-                          <span className="disclosure-chevron" />
-                        </summary>
+                        </div>
+                        <div className="rejection-summary-reasons" aria-label={t("Failure reasons")}>
+                          {rejection.failed_checkpoints.map((checkpoint) => (
+                            <p key={checkpoint}>
+                              <strong>{checkpoint} · {t(checkpointLabel[checkpoint])}</strong>
+                              <span><b>{t("Reason")}:</b> {rejection.failure_reasons[checkpoint] ?? t("No reason was persisted.")}</span>
+                            </p>
+                          ))}
+                        </div>
+                        <details className="rejection-more">
+                          <summary>
+                            <span>{t("View evidence and retry details")}</span>
+                            <span className="disclosure-chevron" />
+                          </summary>
                         <div className="rejection-entry-body">
                           {rejection.failed_checkpoints.map((checkpoint) => (
                             <div className="rejection-checkpoint" key={checkpoint}>
@@ -234,7 +288,8 @@ export function RejectionsPage() {
                           </div>
                           <RunLink runId={rejection.run_id} />
                         </div>
-                      </details>
+                        </details>
+                      </article>
                     ))}
                   </section>
                 ))}

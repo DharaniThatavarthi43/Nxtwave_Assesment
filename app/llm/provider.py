@@ -13,6 +13,8 @@ def create_chat_model(
     settings: Settings | None = None,
     *,
     max_retries: int = MODEL_MAX_RETRIES,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> BaseChatModel:
     """Create the configured LangChain chat model without exposing its key."""
     current_settings = settings if settings is not None else load_settings()
@@ -36,6 +38,8 @@ def create_chat_model(
             request_timeout=MODEL_TIMEOUT_SECONDS,
             retries=max_retries,
             temperature=0.2,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
         )
 
     return ChatGroq(
@@ -44,4 +48,6 @@ def create_chat_model(
         timeout=MODEL_TIMEOUT_SECONDS,
         max_retries=max_retries,
         temperature=0.2,
+        max_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
     )

@@ -26,7 +26,9 @@ from app.api.schemas import (
     LearnedRuleResponse,
     NoteListResponse,
     ProgressEventResponse,
+    RejectionFailureItem,
     RejectionListItem,
+    RejectionLogResponse,
     RunDetailResponse,
     RunListResponse,
     SettingsResponse,
@@ -541,12 +543,12 @@ def create_app(
             raise HTTPException(status_code=404, detail="Approved note not found.")
         return ApprovedNoteResponse.model_validate(note.model_dump())
 
-    @application.get("/api/rejections", response_model=tuple[RejectionListItem, ...])
+    @application.get("/api/rejections", response_model=RejectionLogResponse)
     def rejections(
         request: Request,
         run_id: UUID | None = Query(default=None),
         limit: int = Query(default=100, ge=1, le=500),
-    ) -> tuple[RejectionListItem, ...]:
+    ) -> RejectionLogResponse:
         runtime = _runtime(request)
         try:
             records = (
@@ -554,7 +556,10 @@ def create_app(
                 if run_id is not None
                 else runtime.memory.get_previous_failures()
             )
-            records.sort(key=lambda item: (item.created_at, str(item.rejection_id)))
+            records.sort(
+                key=lambda item: (item.created_at, str(item.rejection_id)),
+                reverse=True,
+            )
             evaluations_by_run: dict[UUID, dict[int, EvaluationResult]] = {}
             items = []
             for record in records[:limit]:
@@ -591,7 +596,36 @@ def create_app(
                         ),
                     )
                 )
-            return tuple(items)
+            failures: list[RejectionFailureItem] = []
+            for failure_kind, attempts in (
+                ("generation", runtime.memory.get_failed_generation_attempts(run_id)),
+                ("evaluation", runtime.memory.get_failed_evaluation_attempts(run_id)),
+            ):
+                for attempt in attempts:
+                    run = runtime.memory.get_run(attempt.run_id)
+                    failures.append(
+                        RejectionFailureItem(
+                            failure_id=attempt.failure_id,
+                            run_id=attempt.run_id,
+                            topic=run.topic if run is not None else None,
+                            mode=run.mode if run is not None else None,
+                            attempt_number=attempt.attempt_number,
+                            failure_kind=failure_kind,
+                            failure_stage=attempt.failure_stage.value,
+                            error_category=attempt.error_category.value,
+                            error_type=attempt.error_type,
+                            error_description=attempt.error_description,
+                            recorded_at=attempt.timestamp,
+                        )
+                    )
+            failures.sort(
+                key=lambda item: (item.recorded_at, str(item.failure_id)),
+                reverse=True,
+            )
+            return RejectionLogResponse(
+                items=tuple(items[:limit]),
+                failures=tuple(failures[:limit]),
+            )
         except (OSError, sqlite3.Error) as exc:
             logger.error("Rejection query failed (%s).", _safe_exception_name(exc))
             raise HTTPException(

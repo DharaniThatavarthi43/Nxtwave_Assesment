@@ -1,4 +1,5 @@
-﻿import sqlite3
+﻿import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
@@ -64,6 +65,7 @@ class WorkflowExecutionError(RuntimeError):
         )
         self.run_id = run_id
         self.attempt_number = attempt_number
+        self.reason = reason
 
 
 class WorkflowPersistenceError(RuntimeError):
@@ -314,11 +316,6 @@ def run_lesson_workflow(
             ReferenceLoadError,
             ValidationError,
         ) as exc:
-            _emit_progress(
-                progress_callback,
-                "failed",
-                attempt_number,
-            )
             _persist(
                 f"failed evaluation attempt {attempt_number}",
                 lambda: manager.save_failed_evaluation_attempt(
@@ -331,6 +328,17 @@ def run_lesson_workflow(
                 manager=manager,
                 run_id=run.run_id,
             )
+            if attempt_number < max_attempts and _evaluation_failure_is_retryable(exc):
+                previous_lesson = lesson
+                previous_feedback = (
+                    "The previous lesson could not be evaluated because the "
+                    "evaluator response was invalid. Regenerate it carefully, "
+                    "use the trusted references, and make each checkpoint easy "
+                    "to verify with clear, literal evidence.",
+                )
+                _emit_progress(progress_callback, "processing_feedback", attempt_number)
+                continue
+            _emit_progress(progress_callback, "failed", attempt_number)
             run = _persist(
                 "failed execution status",
                 lambda: manager.update_run_status(run.run_id, RunStatus.FAILED),
@@ -339,14 +347,9 @@ def run_lesson_workflow(
             raise WorkflowExecutionError(
                 run.run_id,
                 attempt_number,
-                "lesson evaluation failed",
+                "lesson evaluation failed after configured retries",
             ) from exc
         except WorkflowExecutionError as exc:
-            _emit_progress(
-                progress_callback,
-                "failed",
-                attempt_number,
-            )
             _persist(
                 f"failed evaluation attempt {attempt_number}",
                 lambda: manager.save_failed_evaluation_attempt(
@@ -359,12 +362,27 @@ def run_lesson_workflow(
                 manager=manager,
                 run_id=run.run_id,
             )
+            if attempt_number < max_attempts and _evaluation_failure_is_retryable(exc):
+                previous_lesson = lesson
+                previous_feedback = (
+                    "The evaluator produced checkpoint data that did not pass "
+                    "application consistency validation. Regenerate the "
+                    "lesson with clear, explicit checkpoint evidence and "
+                    "faithful correction details.",
+                )
+                _emit_progress(progress_callback, "processing_feedback", attempt_number)
+                continue
+            _emit_progress(progress_callback, "failed", attempt_number)
             _persist(
                 "failed execution status",
                 lambda: manager.update_run_status(run.run_id, RunStatus.FAILED),
                 mark_failed_on_error=False,
             )
-            raise
+            raise WorkflowExecutionError(
+                run.run_id,
+                attempt_number,
+                "lesson evaluation failed after configured retries",
+            ) from exc
 
         _persist(
             f"evaluation for attempt {attempt_number}",
@@ -516,6 +534,17 @@ def _validate_evaluation(
             "evaluator returned incomplete or unexpected correction instructions",
         )
     return validated
+
+
+def _evaluation_failure_is_retryable(error: Exception) -> bool:
+    if isinstance(error, (ConfigurationError, ReferenceLoadError)):
+        return False
+    if isinstance(error, EvaluatorError):
+        return error.error_category not in {
+            EvaluationErrorCategory.CONFIGURATION_ERROR,
+            EvaluationErrorCategory.PROVIDER_PERMANENT_ERROR,
+        }
+    return True
 
 
 def _evaluation_passes(evaluation: EvaluationResult) -> bool:
@@ -746,6 +775,7 @@ def _failed_evaluation_attempt(
         error_description=_safe_evaluation_error_description(
             error_category,
             retry_disposition,
+            error=error,
         ),
     )
 
@@ -797,7 +827,95 @@ def _evaluation_failure_metadata(
 def _safe_evaluation_error_description(
     category: EvaluationErrorCategory,
     retry_disposition: EvaluationRetryDisposition | None,
+    *,
+    error: Exception | None = None,
 ) -> str:
+    if isinstance(error, EvaluatorError):
+        evaluator_message = str(error)
+        clear_reason = re.fullmatch(
+            r"(C[1-6]) requires a clear evaluation reason\.",
+            evaluator_message,
+        )
+        if clear_reason:
+            return f"{clear_reason.group(1)}: The evaluator did not provide a clear reason."
+        missing_evidence = re.fullmatch(
+            r"(C[1-6]) evidence is not a verbatim excerpt from the candidate lesson\.",
+            evaluator_message,
+        )
+        if missing_evidence:
+            return (
+                f"{missing_evidence.group(1)}: The evaluator's evidence did not "
+                "exactly match text in the generated lesson."
+            )
+        unknown_citation = re.fullmatch(
+            r"(C[1-6]) cites unknown reference IDs: [R0-9, ]+\.",
+            evaluator_message,
+        )
+        if unknown_citation:
+            return (
+                f"{unknown_citation.group(1)}: The evaluator cited a reference "
+                "that is not in the selected knowledge sources."
+            )
+        safe_evaluator_messages = {
+            "Failed checkpoints require at least one correction instruction.": (
+                "The evaluator marked a checkpoint as failed but did not provide correction instructions."
+            ),
+            "Correction instructions must be empty when all checkpoints pass.": (
+                "The evaluator returned correction instructions even though all checkpoints passed."
+            ),
+        }
+        if evaluator_message in safe_evaluator_messages:
+            return safe_evaluator_messages[evaluator_message]
+        missing_corrections = re.fullmatch(
+            r"Each failed checkpoint requires its own correction instruction: (C[1-6](?:, C[1-6])*)\.",
+            evaluator_message,
+        )
+        if missing_corrections:
+            return (
+                f"The evaluator did not provide a correction instruction for "
+                f"{missing_corrections.group(1)}."
+            )
+        if evaluator_message.startswith("Invalid reference citation "):
+            return "The evaluator returned an invalid reference citation format."
+        safe_evaluator_messages = {
+            "The model returned malformed structured lesson content.": (
+                "The evaluator response was not valid structured checkpoint data."
+            ),
+            "The model returned an invalid structured evaluation.": (
+                "The evaluator response was missing valid checkpoint fields or contained values outside the required schema."
+            ),
+            "The model returned an evaluation that failed schema validation.": (
+                "The evaluator response did not match the required checkpoint schema."
+            ),
+            "The model returned an empty evaluation response.": (
+                "The evaluator returned no checkpoint results."
+            ),
+            "The model returned a malformed structured evaluation.": (
+                "The evaluator response could not be parsed into checkpoint results."
+            ),
+            "The evaluator request ended without a response.": (
+                "The evaluator did not return checkpoint results after its bounded retries."
+            ),
+        }
+        if evaluator_message in safe_evaluator_messages:
+            return safe_evaluator_messages[evaluator_message]
+    if isinstance(error, WorkflowExecutionError):
+        safe_validation_reasons = {
+            "evaluator returned unsupported result type": (
+                "The evaluator did not return a structured checkpoint result."
+            ),
+            "evaluator returned an inconsistent result": (
+                "The evaluator returned checkpoint data that failed consistency validation."
+            ),
+            "evaluator result does not match the current run and attempt": (
+                "The evaluator result was associated with a different run or attempt."
+            ),
+            "evaluator returned incomplete or unexpected correction instructions": (
+                "The evaluator's correction instructions did not match its failed checkpoints."
+            ),
+        }
+        if error.reason in safe_validation_reasons:
+            return safe_validation_reasons[error.reason]
     if retry_disposition is EvaluationRetryDisposition.RETRY_AFTER_EXCEEDS_CAP:
         return (
             "Evaluator retry was skipped because Retry-After exceeded the "
@@ -869,3 +987,4 @@ def _persist(
         raise WorkflowPersistenceError(
             message
         ) from exc
+
